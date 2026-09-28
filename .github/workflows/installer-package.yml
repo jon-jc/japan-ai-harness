@@ -4,6 +4,8 @@ name: Publish Windows installer package
 # Download with: oras pull ghcr.io/jon-jc/kotoba-studio-installer:0.12.5
 # Windows users can also download the EXE directly from GitHub Releases.
 on:
+  push:
+    tags: ['installer-package-v*']
   workflow_dispatch:
     inputs:
       release_tag:
@@ -16,7 +18,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: installer-package-${{ inputs.release_tag }}
+  group: installer-package-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -28,7 +30,7 @@ jobs:
         shell: pwsh
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
       REPOSITORY: ${{ github.repository }}
     steps:
       - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
@@ -37,6 +39,7 @@ jobs:
       - name: Download and verify released installer
         run: |
           $ErrorActionPreference = 'Stop'
+          $env:RELEASE_TAG = $env:RELEASE_TAG -replace '^installer-package-', ''
           if ($env:RELEASE_TAG -cnotmatch '^v\d+\.\d+\.\d+$') { throw 'Use a release tag such as v0.12.5.' }
           $version = $env:RELEASE_TAG.Substring(1)
           $file = "Kotoba-Studio-$version-Setup.exe"
