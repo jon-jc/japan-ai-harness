@@ -1,0 +1,81 @@
+name: Publish Windows installer package
+
+# Stores the released EXE and checksum as an OCI artifact, not a runnable image.
+# Download with: oras pull ghcr.io/jon-jc/kotoba-studio-installer:0.12.5
+# Windows users can also download the EXE directly from GitHub Releases.
+on:
+  push:
+    tags: ['installer-package-v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release tag containing the Windows installer (for example v0.12.5)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: installer-package-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+        with:
+          version: 1.3.0
+      - name: Download and verify released installer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:RELEASE_TAG = $env:RELEASE_TAG -replace '^installer-package-', ''
+          if ($env:RELEASE_TAG -cnotmatch '^v\d+\.\d+\.\d+$') { throw 'Use a release tag such as v0.12.5.' }
+          $version = $env:RELEASE_TAG.Substring(1)
+          $file = "Kotoba-Studio-$version-Setup.exe"
+          $releaseJson = gh release view $env:RELEASE_TAG --repo $env:REPOSITORY --json 'isDraft,assets'
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read release.' }
+          $release = $releaseJson | ConvertFrom-Json
+          if ($release.isDraft) { throw 'Publish the release before publishing its package.' }
+          gh release download $env:RELEASE_TAG --repo $env:REPOSITORY --pattern $file --pattern "$file.sha256"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot download installer and checksum.' }
+          $checksum = (Get-Content -LiteralPath "$file.sha256" -Raw).Trim()
+          if ($checksum -notmatch ('^([a-fA-F0-9]{64})\s+\*?' + [regex]::Escape($file) + '$')) { throw 'Invalid checksum file.' }
+          $expected = $Matches[1].ToLowerInvariant()
+          $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw 'Installer checksum mismatch.' }
+          $asset = @($release.assets | Where-Object name -eq $file)
+          if ($asset.Count -ne 1 -or $asset[0].digest -ne "sha256:$actual") { throw 'GitHub asset digest mismatch.' }
+          "INSTALLER=$file" >> $env:GITHUB_ENV
+          "INSTALLER_HASH=$actual" >> $env:GITHUB_ENV
+          "PACKAGE=ghcr.io/$($env:REPOSITORY.ToLowerInvariant())-installer:$version" >> $env:GITHUB_ENV
+      - name: Publish package
+        run: |
+          $env:GH_TOKEN | oras login ghcr.io --username '${{ github.actor }}' --password-stdin
+          if ($LASTEXITCODE -ne 0) { throw 'Registry login failed.' }
+          try {
+            oras push $env:PACKAGE --image-spec v1.0 --artifact-type application/vnd.kotoba.windows-installer.v1 `
+              --annotation "org.opencontainers.image.source=https://github.com/$env:REPOSITORY" `
+              --annotation "org.opencontainers.image.description=Kotoba Studio Windows x64 installer. Download with oras pull; run the EXE on Windows." `
+              --annotation "org.opencontainers.image.version=$env:RELEASE_TAG" `
+              "$($env:INSTALLER):application/vnd.microsoft.portable-executable" "$($env:INSTALLER).sha256:text/plain"
+            if ($LASTEXITCODE -ne 0) { throw 'Package publication failed.' }
+            New-Item -ItemType Directory -Path verified | Out-Null
+            oras pull $env:PACKAGE --output verified
+            if ($LASTEXITCODE -ne 0) { throw 'Published package download failed.' }
+            $hash = (Get-FileHash -LiteralPath "verified/$env:INSTALLER" -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne $env:INSTALLER_HASH) { throw 'Published installer failed checksum verification.' }
+            "Published and verified: $env:PACKAGE" >> $env:GITHUB_STEP_SUMMARY
+          } finally {
+            oras logout ghcr.io
+          }
